@@ -3,4 +3,6 @@ venv/
 __pycache__/
 *.pyc
 extracted_data/*
-
+EXTRACTED_BACKUP/*.json
+data/grouped_postal_codes.json
+data/fsa.py
