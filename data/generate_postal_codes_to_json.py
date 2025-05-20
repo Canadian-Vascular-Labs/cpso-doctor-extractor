@@ -1,10 +1,13 @@
 import json
 import os
+import re
 
 input_path = "data/postal_temp.json"
 
 
-def group_postal_codes(output_path: str = "grouped_postal_codes.json", verbose: bool = True) -> None:
+def group_postal_codes(
+    output_path: str = "grouped_postal_codes.json", verbose: bool = True
+) -> None:
     """
     Groups Canadian postal codes by FSA (first 3 characters) and writes to a new JSON file.
 
@@ -13,16 +16,17 @@ def group_postal_codes(output_path: str = "grouped_postal_codes.json", verbose: 
         output_path (str): Path to the output grouped JSON file.
         verbose (bool): If True, print skipped codes and file sizes.
     """
-    with open(input_path, 'r') as f:
+    with open(input_path, "r") as f:
         data = json.load(f)
 
-    postal_codes = data.get('postal_codes', [])
+    postal_codes = data.get("postal_codes", [])
     grouped_postal_codes = {}
 
     for code in postal_codes:
         code = code.strip().upper()
 
-        if len(code) == 7 and code[3] == ' ' and code[:3].isalnum() and code[4:].isalnum():
+        # validate postal code format against REGEX: '^[A-Z]\d[A-Z] \d[A-Z]\d$'
+        if re.match(r"^[A-Z]\d[A-Z] \d[A-Z]\d$", code):
             fsa = code[:3]
             ldu = code[4:]
 
@@ -30,11 +34,10 @@ def group_postal_codes(output_path: str = "grouped_postal_codes.json", verbose: 
         elif verbose:
             print(f"Skipping invalid postal code: {code}")
 
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         json.dump(grouped_postal_codes, f)
 
     if verbose:
         print(f"✅ Grouped postal codes written to: {output_path}")
-        print(
-            f"📦 Size of original file: {os.path.getsize(input_path)} bytes")
+        print(f"📦 Size of original file: {os.path.getsize(input_path)} bytes")
         print(f"📦 Size of grouped file:  {os.path.getsize(output_path)} bytes")
