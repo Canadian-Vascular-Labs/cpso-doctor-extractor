@@ -17,6 +17,7 @@ async def fetch_one(client, sem, url, params, label):
     async with sem:
         for attempt in range(1, 9):
             try:
+                print(f"[fetch_one] {label} Attempt {attempt} - {url} {params}")
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 try:

@@ -1,184 +1,181 @@
-# scraper.py
+from enum import Enum
+from typing import Optional
 import asyncio
 import httpx
-
-from fetch import fetch_one
-from fanout import build_param_sets
-from state import ScraperState
 from utils import generate_valid_ontario_fsas
+from fsaRunner import FSARunner, log
+
+
+class RunMode(str, Enum):
+    FULL = "full"
+    CPSOS = "cpsos"
+
+
+# https://postal-codes.cybo.com/canada/K1H_ottawa/
+# USE THIS TO CREATE DB MAPPING TO ONLY SCRAPE VALID REGIONS
 
 
 class CPSOScraper:
-    def __init__(self, concurrency: int, base_url: str, db):
-        self.base_url = base_url
+    """
+    Orchestrates FSAs sequentially.
+    """
+
+    def __init__(
+        self,
+        concurrency: int,
+        base_url: str,
+        db,
+        run_mode: RunMode = RunMode.FULL,
+        ldu_map: Optional[dict] = None,
+        target_cpsos: Optional[list[str]] = None,
+    ):
+        self.concurrency = concurrency
         self.sem = asyncio.Semaphore(concurrency)
+        self.base_url = base_url
         self.db = db
 
-        self.queue = asyncio.Queue()
-        self.state = ScraperState()
+        self.run_mode = run_mode
+        self.target_cpsos = target_cpsos or []
 
-        self.specialties = []  # load from file / constants if needed
+        self.specialties = [
+            "Addiction Medicine",
+            "Adolescent Medicine",
+            "Anatomical Pathology",
+            "Anesthesiology",
+            "Bacteriology",
+            "Cardiac Surgery",
+            "Cardiology",
+            "Cardiothoracic Surgery",
+            "Cardiovascular and Thoracic Surgery",
+            "Child and Adolescent Psychiatry",
+            "Clinical Immunology",
+            "Clinical Immunology and Allergy",
+            "Clinical Pharmacology",
+            "Clinical Pharmacology and Toxicology",
+            "Clinician Investigator Program",
+            "Colorectal Surgery",
+            "Community Medicine",
+            "Critical Care Medicine",
+            "Dermatology",
+            "Developmental Pediatrics",
+            "Diagnostic and Clinical Pathology",
+            "Diagnostic and Molecular Pathology",
+            "Diagnostic and Therapeutic Radiology",
+            "Diagnostic Radiology",
+            "Emergency Medicine",
+            "Endocrinology and Metabolism",
+            "Family Medicine",
+            "Family Medicine (Emergency Medicine)",
+            "FCFP - Family Medicine",
+            "Forensic Pathology",
+            "Forensic Psychiatry",
+            "Gastroenterology",
+            "General Internal Medicine",
+            "General Pathology",
+            "General Surgery",
+            "General Surgical Oncology",
+            "Geriatric Medicine",
+            "Geriatric Psychiatry",
+            "Gynecologic Oncology",
+            "Gynecologic Reproductive Endocrinology/Infertility",
+            "Hematological Pathology",
+            "Hematology",
+            "Infectious Diseases",
+            "Internal Medicine",
+            "Interventional Radiology",
+            "Laboratory Medicine",
+            "Maternal Fetal Medicine",
+            "Medical Biochemistry",
+            "Medical Genetics and Genomics",
+            "Medical Microbiology",
+            "Medical Oncology",
+            "Neonatal-Perinatal Medicine",
+            "Nephrology",
+            "Neurology",
+            "Neuropathology",
+            "Neuroradiology",
+            "Neurosurgery",
+            "Nuclear Medicine",
+            "Obstetrics and Gynecology",
+            "Occupational Medicine",
+            "Ophthalmology",
+            "Orthopedic Surgery",
+            "Otolaryngology - Head and Neck Surgery",
+            "Pain Medicine",
+            "Palliative Medicine",
+            "Pediatric Cardiology",
+            "Pediatric Critical Care Medicine",
+            "Pediatric Emergency Medicine",
+            "Pediatric Endocrinology and Metabolism",
+            "Pediatric Gastroenterology",
+            "Pediatric General Surgery",
+            "Pediatric Hematology/Oncology",
+            "Pediatric Infectious Diseases",
+            "Pediatric Nephrology",
+            "Pediatric Neurology",
+            "Pediatric Radiology",
+            "Pediatric Respirology",
+            "Pediatric Rheumatology",
+            "Pediatric Surgery",
+            "Pediatrics",
+            "Physical Medicine and Rehabilitation",
+            "Plastic Surgery",
+            "Prehospital and Transport Medicine",
+            "Psychiatry",
+            "Public Health",
+            "Public Health and Preventive Medicine",
+            "Radiation Oncology",
+            "Respirology",
+            "Rheumatology",
+            "Sport and Exercise Medicine",
+            "Surgical Foundations",
+            "Thoracic Surgery",
+            "Urology",
+            "Vascular Surgery",
+        ]
 
-        self.extracted = set()  # CPSO numbers
-        self.extracted_lock = asyncio.Lock()
-
-        self.request_count = 0
-        self.start_time = None
-        self.active_workers = 0
-
+        self.ldu_map = ldu_map or {}
 
     # -------------------------
-    # public entrypoint
-    # -------------------------
-    async def run(self, stop_event: asyncio.Event):
-        self.start_time = asyncio.get_event_loop().time()
-        reporter_task = asyncio.create_task(self.reporter(stop_event))
-
+    async def run(self):
         async with httpx.AsyncClient(timeout=30) as client:
-            self.client = client
-
-            await self._seed_queue()
-
-            workers = [
-                asyncio.create_task(self.worker(i, stop_event))
-                for i in range(self.sem._value)
-            ]
-            await self.queue.join()
-            stop_event.set()
-
-            # cancel workers
-            for w in workers:
-                w.cancel()
-            reporter_task.cancel()
-
-            await asyncio.gather(*workers, reporter_task, return_exceptions=True)
-
+            if self.run_mode == RunMode.CPSOS:
+                await self.run_cpsos(client)
+            else:
+                await self.run_all_fsas(client)
 
     # -------------------------
-    # queue seeding
-    # -------------------------
-    async def _seed_queue(self):
-        # fsas = generate_valid_ontario_fsas()
+    async def run_all_fsas(self, client):
+        # fsa is key in ldu_map
+        assert self.ldu_map is not None
+        fsas = list(self.ldu_map.keys())
 
-        # for fsa in fsas:
-        #     # start at fan_level 0
-        #     await self.queue.put((fsa, 0, {}))
-        # print(f"[+] Seeded {len(fsas)} FSAs")
-        await self.queue.put(("K1K 0T2", 1, {}))
-
-
-    # -------------------------
-    # worker loop
-    # -------------------------
-    async def worker(self, wid: int, stop_event: asyncio.Event):
-        while not stop_event.is_set():
-            try:
-                postal, fan_level, params = await asyncio.wait_for(
-                    self.queue.get(), timeout=1.0
-                )
-            except asyncio.TimeoutError:
-                continue
-            
-            self.active_workers += 1
-            try:
-                await self.handle_task(postal, fan_level, params)
-            finally:
-                self.queue.task_done()
-                self.active_workers -= 1
+        for _, fsa in enumerate(fsas, 1):
+            runner = FSARunner(
+                fsa,
+                client=client,
+                sem=self.sem,
+                base_url=self.base_url,
+                db=self.db,
+                specialties=self.specialties,
+                concurrency=self.concurrency,
+                ldus=self.ldu_map.get(fsa, []),
+            )
+            await runner.run()
 
     # -------------------------
-    # core task logic
-    # -------------------------
-    async def handle_task(self, postal, fan_level, params):
-        if self.state.seen(postal, params):
-            return
-
-        response = await fetch_one(
-            self.client,
-            self.sem,
-            self.base_url,
-            params,
-            label=f"{postal}|{fan_level}",
+    async def run_cpsos(self, client):
+        runner = FSARunner(
+            "CPSO",
+            client=client,
+            sem=self.sem,
+            base_url=self.base_url,
+            db=self.db,
+            specialties=self.specialties,
+            concurrency=self.concurrency,
         )
 
-        if not response:
-            return
+        for cpsonum in self.target_cpsos:
+            await runner.queue.put(("CPSO", 0, {"cpsonumber": str(cpsonum)}))
 
-        total = response.get("totalcount")
-        # after every successful fetch
-        self.request_count += 1
-
-        # CPSO signals too many results
-        if total == -1:
-            await self.fan_out(postal, fan_level, params)
-            return
-        
-
-
-        results = response.get("results") or []
-        for r in results:
-            await self.handle_result(r)
-
-    # -------------------------
-    # fan logic
-    # -------------------------
-    async def fan_out(self, postal, fan_level, params):
-        next_level = fan_level + 1
-
-        for new_params in build_param_sets(
-            postal,
-            self.specialties,
-            next_level,
-            params,
-        ):
-            print(
-                f"[fan] {postal} | level={fan_level} → {next_level} "
-                f"| params={list(new_params.items())}"
-            )
-            await self.queue.put((postal, next_level, new_params))
-
-    # -------------------------
-    # result handling
-    # -------------------------
-    async def handle_result(self, res: dict):
-        cpsonum = res.get("cpsonumber")
-        if not cpsonum:
-            return
-
-        async with self.extracted_lock:
-            if cpsonum in self.extracted:
-                return
-            self.extracted.add(cpsonum)
-
-        # write to DB 
-        record = {
-            "cpsonumber": cpsonum,
-            "name": res.get("name", ""),
-            "specialties": res.get("specialties", ""),
-            "street1": res.get("street1", ""),
-            "city": res.get("city", ""),
-            "province": res.get("province", ""),
-            "postalcode": res.get("postalcode", ""),
-            "phonenumber": res.get("phonenumber", ""),
-            "registrationstatus": res.get("registrationstatus", ""),
-            "additionaladdresses": res.get("additionaladdresses", []),
-            # etc — map once here
-        }
-        # 🔥 async, non-blocking, safe
-        await self.db.enqueue_records([record])
-
-
-
-    async def reporter(self, stop_event: asyncio.Event):
-        while not stop_event.is_set():
-            await asyncio.sleep(5)
-
-            elapsed = asyncio.get_event_loop().time() - self.start_time
-            rps = self.request_count / elapsed if elapsed else 0
-
-            print(
-                f"[status] extracted={len(self.extracted):,} "
-                f"| queue={self.queue.qsize():,} "
-                f"| active={self.active_workers} "
-                f"| req/s={rps:.1f}"
-            )
+        await runner.run(False)
